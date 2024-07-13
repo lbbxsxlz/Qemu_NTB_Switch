@@ -29,4 +29,4 @@ ADD ./yocto_files $PROJECT_PATH/yocto_files
 
 ENTRYPOINT ["/home/user/project/scripts/dispatch_docker_command.sh"]
 
-CMD ["build"]
+CMD ["--command=build"]

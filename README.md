@@ -83,10 +83,37 @@ The general syntax is:
 ```
 Run `./run_container.sh -h` to see the help.
 
-*NOTE:* `run_container.sh` has one extra option -- `--host-build-dir=DIR`.
-It represents relative path to the build directory that is mapped to the
-container. This argument is not passed to the container's entrypoint. By
-default the `./build_vm_image` directory is used.
+*NOTE:* `run_container.sh` has extra host-side options:
+
+- `--host-build-dir=DIR` sets the relative path to the build directory mapped
+  to the container. This argument is not passed to the container's entrypoint.
+  By default the `./build_vm_image` directory is used.
+- `--docker-no-cache` forces rebuilding the Docker image without cache.
+- `--docker-shm-size=SIZE` overrides the Docker shared memory size.
+- `--docker-base-image=IMAGE` overrides the Dockerfile base image. This is
+  useful when Docker Hub is unreachable and a registry mirror or preloaded
+  image must be used instead of `ubuntu:22.04`.
+
+If the host requires an outbound proxy, export `http_proxy`, `https_proxy`, and
+`no_proxy` before invoking `run_container.sh`. These variables are forwarded to
+both `docker build` and `docker run` automatically.
+
+If you invoke `docker build` directly instead of using `run_container.sh`, pass
+the proxy values explicitly, for example:
+
+```bash
+docker build \
+  --build-arg "http_proxy=$http_proxy" \
+  --build-arg "https_proxy=$https_proxy" \
+  --build-arg "no_proxy=$no_proxy" \
+  -t yocto .
+```
+
+When preparing Yocto sources, `scripts/prepare_yocto.sh` uses
+`https://github.com/yoctoproject/poky.git` by default because some environments
+cannot reach `git.yoctoproject.org` over the native git protocol. Override this
+by exporting `POKY_GIT_URL` before invoking the build scripts when an internal
+mirror is preferred.
 
 ### Using locally
 

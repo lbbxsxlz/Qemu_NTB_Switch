@@ -1,0 +1,55 @@
+From 6e95e866f3432bafb0b2c935b4bc9f8c42bbbc75 Mon Sep 17 00:00:00 2001
+From: OpenEmbedded <oe.patch@oe>
+Date: Wed, 3 Jun 2026 03:30:00 +0000
+Subject: [PATCH] ntb_perf: report throughput in KBytes/s
+
+The current debug output and debugfs run statistics report throughput in
+MBytes/s using integer division. For slow transfers this truncates to zero
+and hides useful information. Report the same value in KBytes/s instead.
+
+---
+ drivers/ntb/test/ntb_perf.c | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/ntb/test/ntb_perf.c b/drivers/ntb/test/ntb_perf.c
+index 3c779f38de0c..dfec064da7c8 100644
+--- a/drivers/ntb/test/ntb_perf.c
++++ b/drivers/ntb/test/ntb_perf.c
+@@ -82,3 +82,4 @@
+ #include <linux/workqueue.h>
+ #include <linux/debugfs.h>
++#include <linux/math64.h>
+ #include <linux/random.h>
+@@ -963,4 +964,11 @@ static int perf_run_test(struct perf_thread *pthr)
+ 	return 0;
+ }
+ 
++static u64 perf_get_kbytesps(const struct perf_thread *pthr)
++{
++	u64 duration_us = max_t(u64, (u64)ktime_to_us(pthr->duration), 1ULL);
++
++	return mul_u64_u64_div_u64(pthr->copied, 1000ULL, duration_us);
++}
++
+ static int perf_sync_test(struct perf_thread *pthr)
+@@ -986,7 +994,7 @@ no_dma_ret:
+ 	dev_dbg(&perf->ntb->dev, "%d: lasted %llu usecs\n",
+ 		pthr->tidx, ktime_to_us(pthr->duration));
+ 
+-	dev_dbg(&perf->ntb->dev, "%d: %llu MBytes/s\n", pthr->tidx,
+-		div64_u64(pthr->copied, ktime_to_us(pthr->duration)));
++	dev_dbg(&perf->ntb->dev, "%d: %llu KBytes/s\n", pthr->tidx,
++		perf_get_kbytesps(pthr));
+ 
+ 	return 0;
+@@ -1141,5 +1149,5 @@ static int perf_read_stats(struct perf_ctx *perf, char *buf,
+ 		(*pos) += scnprintf(buf + *pos, size - *pos,
+-			"%d: copied %llu bytes in %llu usecs, %llu MBytes/s\n",
+-			tidx, pthr->copied, ktime_to_us(pthr->duration),
+-			div64_u64(pthr->copied, ktime_to_us(pthr->duration)));
++			"%d: copied %llu bytes in %llu usecs, %llu KBytes/s\n",
++			tidx, pthr->copied, ktime_to_us(pthr->duration),
++			perf_get_kbytesps(pthr));
+ 	}
+-- 
+2.34.1

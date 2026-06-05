@@ -17,8 +17,13 @@ if [[ $BUILD_VAL == "all" || $BUILD_VAL == "image" ]]; then
     bitbake -c deploy virtual/kernel
     bitbake core-image-full-cmdline
     # Create two image copies for VMs
-    cp -ruT tmp/deploy/images/qemu${NTB_CXL_ARCH}/ ./guest_1
-    cp -ruT tmp/deploy/images/qemu${NTB_CXL_ARCH}/ ./guest_2
+    if [ ! -d "tmp/deploy/images/$YOCTO_MACHINE" ]; then
+        echo "Yocto image directory 'tmp/deploy/images/$YOCTO_MACHINE' does not exist." >&2
+        exit 1
+    fi
+
+    cp -ruT "tmp/deploy/images/$YOCTO_MACHINE/" ./guest_1
+    cp -ruT "tmp/deploy/images/$YOCTO_MACHINE/" ./guest_2
 fi
 
 if [[ $BUILD_VAL == "all" || $BUILD_VAL == "qemu" ]]; then

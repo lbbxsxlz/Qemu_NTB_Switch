@@ -29,6 +29,7 @@ use extended flags with the suffix '-override', e.g. '--vm1-opts-override'
 
 export BUILD_VAL="all"
 export NTB_CXL_ARCH="x86_64"
+export YOCTO_MACHINE="qemux86-64"
 
 for ARGUMENT in "$@"; do
     KEY="$(echo "$ARGUMENT" | cut -f1 -d=)"

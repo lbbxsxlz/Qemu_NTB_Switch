@@ -7,11 +7,34 @@ set -e
 
 . "$(dirname $0)"/common_variables.sh
 
+DEFAULT_POKY_GIT_URL="https://github.com/yoctoproject/poky.git"
+POKY_GIT_URL="${POKY_GIT_URL:-$DEFAULT_POKY_GIT_URL}"
+
 cd $YOCTO_WORK_DIR
+if [ -d poky ] && [ ! -d poky/.git ]; then
+    rm -rf poky
+fi
+
 if [ ! -d poky ]; then
-    git clone git://git.yoctoproject.org/poky.git
+    git clone "$POKY_GIT_URL" poky
 fi
 cd poky
+
+CURRENT_ORIGIN_URL="$(git remote get-url origin)"
+if [ "$CURRENT_ORIGIN_URL" != "$POKY_GIT_URL" ]; then
+    case "$CURRENT_ORIGIN_URL" in
+        git://git.yoctoproject.org/poky|git://git.yoctoproject.org/poky.git|https://git.yoctoproject.org/poky|https://git.yoctoproject.org/poky.git)
+            git remote set-url origin "$POKY_GIT_URL"
+            ;;
+    esac
+
+    if [ "$POKY_GIT_URL" != "$DEFAULT_POKY_GIT_URL" ]; then
+        git remote set-url origin "$POKY_GIT_URL"
+    fi
+fi
+
+git fetch origin "$YOCTO_VER_NAME"
+
 if ! git checkout my-$YOCTO_VER_NAME; then
     git checkout -t origin/$YOCTO_VER_NAME  -b my-$YOCTO_VER_NAME
 fi

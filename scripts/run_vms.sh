@@ -43,8 +43,8 @@ ivshmem_server="$(find ./tmp/work/x86_64-linux/qemu-system-native -type f -name 
 vm1_dir=guest_1
 vm2_dir=guest_2
 
-drive=$vm1_dir/core-image-full-cmdline-qemu${ARCH}.ext4
-drive2=$vm2_dir/core-image-full-cmdline-qemu${ARCH}.ext4
+drive=$vm1_dir/core-image-full-cmdline-${YOCTO_MACHINE}.ext4
+drive2=$vm2_dir/core-image-full-cmdline-${YOCTO_MACHINE}.ext4
 case "$ARCH" in
 	x86_64)
 		kernel=$vm1_dir/bzImage

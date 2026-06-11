@@ -73,6 +73,10 @@ DOCKER_RUN_ARGS=(
     -v "$PWD"/yocto_files:/home/user/project/yocto_files
 )
 
+if [ -e /dev/kvm ]; then
+    DOCKER_RUN_ARGS+=(--device /dev/kvm --group-add "$(stat -c %g /dev/kvm)")
+fi
+
 for proxy_var in "${PROXY_VARS[@]}"; do
     if [ -n "${!proxy_var}" ]; then
         DOCKER_RUN_ARGS+=(-e "$proxy_var=${!proxy_var}")

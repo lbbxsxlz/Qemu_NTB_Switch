@@ -31,6 +31,22 @@ get_vm_opts(){
 	echo "$OPTS"
 }
 
+wait_for_ivshmem_socket(){
+	local socket_path=$1
+	local retries=50
+
+	while [ $retries -gt 0 ]; do
+		if [ -S "$socket_path" ]; then
+			return 0
+		fi
+		sleep 0.1
+		retries=$((retries - 1))
+	done
+
+	echo "error: ivshmem socket was not created: $socket_path" >&2
+	return 1
+}
+
 . "$(dirname $0)"/common_variables.sh
 
 cd "$YOCTO_WORK_DIR"/poky/build
@@ -76,7 +92,11 @@ fi
 COMMON_OPTIONS_DEFAULT="-smp 4 -m 256 -nographic -monitor null"
 case "$ARCH" in
 	x86_64)
-		COMMON_OPTIONS_DEFAULT="$COMMON_OPTIONS_DEFAULT -cpu IvyBridge -machine q35"
+		if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+			COMMON_OPTIONS_DEFAULT="$COMMON_OPTIONS_DEFAULT -cpu host -machine q35,accel=kvm"
+		else
+			COMMON_OPTIONS_DEFAULT="$COMMON_OPTIONS_DEFAULT -cpu IvyBridge -machine q35"
+		fi
 		;;
 	riscv64)
 		COMMON_OPTIONS_DEFAULT="$COMMON_OPTIONS_DEFAULT -machine virt"
@@ -116,7 +136,9 @@ if [ "$QEMU_SHM_SIZE" ]; then
 		-machine memory-backend=mem -m $((QEMU_SHM_SIZE / 2))m"
 fi
 
+rm -f /tmp/ivshmem_socket
 "$ivshmem_server" -m . -l 1M -n 3 -F &
+wait_for_ivshmem_socket /tmp/ivshmem_socket
 
 "$qemu" \
 	-drive file="$drive",if=virtio,format=raw \

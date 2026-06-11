@@ -45,10 +45,10 @@
 
 #define IVSHMEM_REG_BAR_SIZE 0x2000
 
-#define IDT_BAR_APERTURE_POWER 20
-#define IDT_BAR_APERTURE_SIZE (1U << IDT_BAR_APERTURE_POWER) /* 256MiB */
+#define IDT_BAR_APERTURE_POWER 22
+#define IDT_BAR_APERTURE_SIZE (1U << IDT_BAR_APERTURE_POWER) /* 4MiB */
 
-#define IVSHMEM_DEBUG 1
+#define IVSHMEM_DEBUG 0
 #define IVSHMEM_DPRINTF(fmt, ...)                       \
     do {                                                \
         if (IVSHMEM_DEBUG) {                            \
@@ -77,6 +77,7 @@ DECLARE_INSTANCE_CHECKER(IVShmemState, IVSHMEM_NTB_IDT,
 #define SWITCH_CASE_WRITE_BARREG(reg, fld, ind) case IDT_NT_ ## reg ## ind: \
             s->bar_config[ind].fld = (uint32_t)val; \
             IVSHMEM_DPRINTF("Set the local %s%d to value 0x%x\n", #reg, ind, (uint32_t)val); \
+            idt_bar_update_peer_ram_alias(s, ind); \
             break;
 #define SWITCH_CASE_WRITE_BARREGS(reg, fld) SWITCH_CASE_WRITE_BARREG(reg, fld, 0) \
             SWITCH_CASE_WRITE_BARREG(reg, fld, 1) \
@@ -162,6 +163,13 @@ struct IVShmemState {
 
     /* IDT device BARs */
     MemoryRegion bars[6]; /* BAR 0 maps configuration space, others are general purpose */
+    MemoryRegion bar_io[6];
+    MemoryRegion peer_ram;
+    MemoryRegion peer_ram_alias[6];
+    bool peer_ram_initialized;
+    bool peer_ram_alias_initialized[6];
+    bool peer_ram_alias_mapped[6];
+    uint64_t peer_ram_size;
 
     /* interrupt support */
     Peer *peers;
@@ -373,6 +381,25 @@ enum idt_ivshmem_eventfds {
     EVENTFD_INTERRUPT_HOST,
 };
 
+static bool idt_peer_eventfd_ready(IVShmemState *s, unsigned int vector)
+{
+    int other_vm_id;
+
+    if (s->other_vm_id == -1 && s->other_vm_id_shared) {
+        other_vm_id = *s->other_vm_id_shared;
+        if (other_vm_id >= 0 && other_vm_id < s->nb_peers &&
+            other_vm_id != s->vm_id) {
+            s->other_vm_id = other_vm_id;
+        }
+    }
+
+    if (s->other_vm_id < 0 || s->other_vm_id >= s->nb_peers) {
+        return false;
+    }
+
+    return s->peers[s->other_vm_id].nb_eventfds > vector;
+}
+
 #pragma pack(push, 1)
 struct idt_ivshmem_vm_shm_storage {
     uint32_t id;
@@ -392,6 +419,25 @@ enum idt_interrupts {
     IDT_NTINTSTS_DBELL = 0x2U,
     IDT_NTINTSTS_SEVENT = 0x8U,
 };
+
+static void idt_kick_peer_interrupt(IVShmemState *s)
+{
+    if (!s->peer_regs || !idt_peer_eventfd_ready(s, EVENTFD_INTERRUPT_HOST)) {
+        return;
+    }
+
+    if (s->peer_regs->intsts & ~s->gregs->nt_int_mask) {
+        event_notifier_set(&s->peers[s->other_vm_id].eventfds[EVENTFD_INTERRUPT_HOST]);
+        IVSHMEM_DPRINTF("Kicked pending peer interrupt (vm%d -> vm%d, intsts 0x%lx)\n",
+                s->vm_id, s->other_vm_id, s->peer_regs->intsts);
+    }
+}
+
+static void idt_raise_peer_interrupt(IVShmemState *s, uint32_t intsts_bit)
+{
+    s->peer_regs->intsts |= intsts_bit;
+    idt_kick_peer_interrupt(s);
+}
 
 static inline uint32_t ivshmem_has_feature(IVShmemState *ivs, unsigned int feature)
 {
@@ -446,19 +492,15 @@ static void write_outbound_msg(IVShmemState *s, int index, uint64_t val)
     s->peer_regs->msg[index] = val;
     IVSHMEM_DPRINTF("Wrote value 0x%lx to the outbound message register %d\n", val, index);
 
-    if (s->other_vm_id != -1)
-    {
-        s->peer_regs->msgsts |= (0x1U << (IDT_FLD_INMSGSTS0 + index));
-        s->peer_regs->inb_msg_src[index] = s->regs->inbound_mw_part;
+    s->peer_regs->msgsts |= (0x1U << (IDT_FLD_INMSGSTS0 + index));
+    s->peer_regs->inb_msg_src[index] = s->regs->inbound_mw_part;
 
-        if ((~s->peer_regs->msgsts_mask & (0x1U << (IDT_FLD_INMSGSTS0 + index))) &&
-                (~s->gregs->nt_int_mask & IDT_NTINTSTS_MSG))
-        {
-            s->peer_regs->intsts |= IDT_NTINTSTS_MSG;
-            event_notifier_set(&s->peers[s->other_vm_id].eventfds[EVENTFD_INTERRUPT_HOST]);
-            IVSHMEM_DPRINTF("Sent message register update notification (vm%d -> vm%d)\n",
-                    s->vm_id, s->other_vm_id);
-        }
+    if ((~s->peer_regs->msgsts_mask & (0x1U << (IDT_FLD_INMSGSTS0 + index))) &&
+            (~s->gregs->nt_int_mask & IDT_NTINTSTS_MSG))
+    {
+        idt_raise_peer_interrupt(s, IDT_NTINTSTS_MSG);
+        IVSHMEM_DPRINTF("Sent message register update notification (vm%d -> vm%d)\n",
+                s->vm_id, s->other_vm_id);
     }
 }
 
@@ -593,6 +635,139 @@ static void init_vm_ids(IVShmemState *s)
     IVSHMEM_DPRINTF("Started vm with self_number=%d and vm_id=%d\n", s->self_number, s->vm_id);
 }
 
+static const char *idt_peer_ram_path(uint32_t self_number)
+{
+    return self_number == 0 ? "/dev/shm/qemu2" : "/dev/shm/qemu1";
+}
+
+static bool idt_init_peer_ram_region(IVShmemState *s)
+{
+    Error *local_err = NULL;
+    struct stat statbuf;
+    const char *path;
+    int fd;
+
+    if (s->peer_ram_initialized) {
+        return true;
+    }
+
+    path = idt_peer_ram_path(s->self_number);
+    fd = open(path, O_RDWR);
+    if (fd == -1) {
+        IVSHMEM_DPRINTF("idt-ntb-ivshmem: can't open %s for MW alias: %s\n",
+                        path, strerror(errno));
+        return false;
+    }
+
+    if (fstat(fd, &statbuf) == -1) {
+        error_report("idt-ntb-ivshmem: can't stat %s for MW alias: %s",
+                     path, strerror(errno));
+        close(fd);
+        return false;
+    }
+
+    if (statbuf.st_size <= 0) {
+        error_report("idt-ntb-ivshmem: %s has invalid size %ld",
+                     path, (long)statbuf.st_size);
+        close(fd);
+        return false;
+    }
+
+    memory_region_init_ram_from_fd(&s->peer_ram, OBJECT(s),
+                                   "idt-peer-ram", statbuf.st_size,
+                                   RAM_SHARED, fd, 0, &local_err);
+    if (local_err) {
+        error_report_err(local_err);
+        close(fd);
+        return false;
+    }
+
+    s->peer_ram_size = statbuf.st_size;
+    s->peer_ram_initialized = true;
+    return true;
+}
+
+static void idt_bar_remove_peer_ram_alias(IVShmemState *s, unsigned int idx)
+{
+    if (s->peer_ram_alias_mapped[idx]) {
+        memory_region_transaction_begin();
+        memory_region_del_subregion(&s->bars[idx], &s->peer_ram_alias[idx]);
+        s->peer_ram_alias_mapped[idx] = false;
+        memory_region_transaction_commit();
+    }
+}
+
+static void idt_bar_update_peer_ram_alias(IVShmemState *s, unsigned int idx)
+{
+    BARConfig c;
+    uint64_t bar_base;
+    uint64_t peer_offset;
+    uint64_t window_size;
+    char name[32];
+
+    if (idx < 2 || idx > 4) {
+        return;
+    }
+
+    c = s->bar_config[idx];
+    bar_base = s->bars[idx].addr;
+    peer_offset = ((uint64_t)c.utbase << 32) + c.ltbase;
+
+    if (!(c.setup & (1U << IDT_FLD_BARSETUP_ENABLE)) ||
+        (c.setup & (1U << IDT_FLD_BARSETUP_MODE)) ||
+        c.limit <= bar_base) {
+        idt_bar_remove_peer_ram_alias(s, idx);
+        return;
+    }
+
+    window_size = MIN((uint64_t)IDT_BAR_APERTURE_SIZE, c.limit - bar_base);
+    if (!window_size || !idt_init_peer_ram_region(s) ||
+        peer_offset >= s->peer_ram_size ||
+        window_size > s->peer_ram_size - peer_offset) {
+        idt_bar_remove_peer_ram_alias(s, idx);
+        return;
+    }
+
+    if (!s->peer_ram_alias_initialized[idx]) {
+        snprintf(name, sizeof(name), "idt-bar%u-peer-ram", idx);
+        memory_region_init_alias(&s->peer_ram_alias[idx], OBJECT(s), name,
+                                 &s->peer_ram, peer_offset, window_size);
+        s->peer_ram_alias_initialized[idx] = true;
+    } else {
+        memory_region_set_alias_offset(&s->peer_ram_alias[idx], peer_offset);
+        memory_region_set_size(&s->peer_ram_alias[idx], window_size);
+    }
+
+    memory_region_transaction_begin();
+    if (s->peer_ram_alias_mapped[idx]) {
+        memory_region_del_subregion(&s->bars[idx], &s->peer_ram_alias[idx]);
+        s->peer_ram_alias_mapped[idx] = false;
+    }
+
+    memory_region_add_subregion_overlap(&s->bars[idx], 0,
+                                        &s->peer_ram_alias[idx], 100);
+    s->peer_ram_alias_mapped[idx] = true;
+    memory_region_transaction_commit();
+    IVSHMEM_DPRINTF("BAR%u peer RAM alias: offset 0x%lx size 0x%lx\n",
+                    idx, peer_offset, window_size);
+}
+
+static void idt_bar_refresh_peer_ram_aliases(IVShmemState *s)
+{
+    unsigned int idx;
+
+    for (idx = 2; idx <= 4; idx++) {
+        idt_bar_update_peer_ram_alias(s, idx);
+    }
+}
+
+static void idt_notify_peer_bar_config_changed(IVShmemState *s)
+{
+    if (idt_peer_eventfd_ready(s, EVENTFD_VM_ID)) {
+        event_notifier_set(&s->peers[s->other_vm_id].eventfds[EVENTFD_VM_ID]);
+    }
+}
+
 /*****************************************/
 
 static void ivshmem_io_write(void *opaque, hwaddr addr,
@@ -645,14 +820,10 @@ static void ivshmem_io_write(void *opaque, hwaddr addr,
             s->peer_regs->db = val;
             IVSHMEM_DPRINTF("Wrote value 0x%lx to the outbound doorbell\n", val);
 
-            if (s->other_vm_id != -1)
-            {
-                if (~s->gregs->nt_int_mask & IDT_NTINTSTS_DBELL) {
-                    s->peer_regs->intsts |= IDT_NTINTSTS_DBELL;
-                    event_notifier_set(&s->peers[s->other_vm_id].eventfds[EVENTFD_INTERRUPT_HOST]);
-                    IVSHMEM_DPRINTF("Sent doorbell register update notification (vm%d -> vm%d)\n",
-                            s->vm_id, s->other_vm_id);
-                }
+            if (~s->gregs->nt_int_mask & IDT_NTINTSTS_DBELL) {
+                idt_raise_peer_interrupt(s, IDT_NTINTSTS_DBELL);
+                IVSHMEM_DPRINTF("Sent doorbell register update notification (vm%d -> vm%d)\n",
+                        s->vm_id, s->other_vm_id);
             }
             break;
         case IDT_NT_INDBELLSTS:
@@ -678,8 +849,7 @@ static void ivshmem_io_write(void *opaque, hwaddr addr,
             IVSHMEM_DPRINTF("Write to NTSIGNAL: set flag in SEGSIGSTS\n");
             /* TODO: honor SEGSIGMSK */
             if (~s->gregs->nt_int_mask & IDT_NTINTSTS_SEVENT) {
-                s->peer_regs->intsts |= IDT_NTINTSTS_SEVENT;
-                event_notifier_set(&s->peers[s->other_vm_id].eventfds[EVENTFD_INTERRUPT_HOST]);
+                idt_raise_peer_interrupt(s, IDT_NTINTSTS_SEVENT);
                 IVSHMEM_DPRINTF("Notified the peer about SEGSIGSTS update (vm%d -> vm%d)\n",
                         s->vm_id, s->other_vm_id);
             }
@@ -702,17 +872,20 @@ static void ivshmem_io_write(void *opaque, hwaddr addr,
 
         case IDT_OOF_LDATA:
             s->peer_bar_config[s->lregs.inbound_mw_bar].ltbase = (uint32_t)val;
+            idt_notify_peer_bar_config_changed(s);
             IVSHMEM_DPRINTF("Set the ltbase in BAR%u of the peer to 0x%lx\n", s->lregs.inbound_mw_bar, val);
             break;
 
         case IDT_OOF_HDATA:
             s->peer_bar_config[s->lregs.inbound_mw_bar].utbase = (uint32_t)val;
+            idt_notify_peer_bar_config_changed(s);
             IVSHMEM_DPRINTF("Set the utbase in BAR%u of the peer to 0x%lx\n", s->lregs.inbound_mw_bar, val);
             break;
 
         case IDT_OOF_LLIMIT:
         case IDT_OOF_HLIMIT:
             s->peer_bar_config[s->lregs.inbound_mw_bar].limit = (uint32_t)val;
+            idt_notify_peer_bar_config_changed(s);
             IVSHMEM_DPRINTF("Set the limit in BAR%u of the peer to 0x%lx\n", s->lregs.inbound_mw_bar, val);
             IVSHMEM_DPRINTF("[Host %d] Addr of peer_bar_config: 0x%p. Addr of local bar_config: 0x%p\n",
                     s->self_number, (void*)s->peer_bar_config, (void*)s->bar_config);
@@ -842,8 +1015,8 @@ static void *map_peer_shm(uint32_t self_number) {
         IVSHMEM_DPRINTF("Trying to map peer physical memory\n");
 
         /* Map peer physical memory */
-        /* fd = shm_open(s->self_number == 0 ? "qemu2" : "qemu1", O_RDWR, 0); - requires -lrt */
-        fd = open(self_number == 0 ? "/dev/shm/qemu2" : "/dev/shm/qemu1", O_RDWR);
+        /* shm_open() would require -lrt; use the known memory-backend-file path. */
+        fd = open(idt_peer_ram_path(self_number), O_RDWR);
         if (fd == -1) {
             error_report("idt-ntb-ivshmem: can't open shm, MW access failed\n");
             return NULL;
@@ -1004,6 +1177,8 @@ static void ivshmem_vector_notify(void *opaque)
     switch (vector) {
         case EVENTFD_VM_ID:
             s->other_vm_id = *s->other_vm_id_shared;
+            idt_bar_refresh_peer_ram_aliases(s);
+            idt_kick_peer_interrupt(s);
             break;
         case EVENTFD_INTERRUPT_HOST:
             IVSHMEM_DPRINTF("Passing interrupt to the host (vm%d)\n", s->vm_id);
@@ -1199,6 +1374,15 @@ static void setup_interrupt(IVShmemState *s, int vector, Error **errp)
 
     IVSHMEM_DPRINTF("setting up interrupt for vector: %d\n", vector);
 
+    if (vector == EVENTFD_VM_ID || vector == EVENTFD_INTERRUPT_HOST) {
+        watch_vector_notifier(s, n, vector);
+        if (vector == EVENTFD_INTERRUPT_HOST) {
+            init_vm_ids(s);
+            idt_kick_peer_interrupt(s);
+        }
+        return;
+    }
+
     if (!with_irqfd) {
         IVSHMEM_DPRINTF("with eventfd\n");
         watch_vector_notifier(s, n, vector);
@@ -1221,6 +1405,7 @@ static void setup_interrupt(IVShmemState *s, int vector, Error **errp)
     }
     if (vector == 1){
         init_vm_ids(s);
+        idt_kick_peer_interrupt(s);
     }
 }
 
@@ -1296,6 +1481,10 @@ static void process_msg_connect(IVShmemState *s, uint16_t posn, int fd,
 
     if (ivshmem_has_feature(s, IVSHMEM_IOEVENTFD)) {
         ivshmem_add_eventfd(s, posn, vector);
+    }
+
+    if (posn != s->vm_id && vector == EVENTFD_INTERRUPT_HOST) {
+        idt_kick_peer_interrupt(s);
     }
 }
 
@@ -1619,12 +1808,23 @@ static void ivshmem_common_realize(PCIDevice *dev, Error **errp)
     memory_region_init_io(&s->bars[0], OBJECT(s), &ivshmem_mmio_ops, s,
                           "idt-mmio", IVSHMEM_REG_BAR_SIZE);
 
-    memory_region_init_io(&s->bars[2], OBJECT(s), &idt_bar2_ops, s,
-                          "idt-bar2", IDT_BAR_APERTURE_SIZE);
-    memory_region_init_io(&s->bars[3], OBJECT(s), &idt_bar3_ops, s,
-                          "idt-bar3", IDT_BAR_APERTURE_SIZE);
-    memory_region_init_io(&s->bars[4], OBJECT(s), &idt_bar4_ops, s,
-                          "idt-bar4", IDT_BAR_APERTURE_SIZE);
+    memory_region_init(&s->bars[2], OBJECT(s), "idt-bar2",
+                       IDT_BAR_APERTURE_SIZE);
+    memory_region_init_io(&s->bar_io[2], OBJECT(s), &idt_bar2_ops, s,
+                          "idt-bar2-io", IDT_BAR_APERTURE_SIZE);
+    memory_region_add_subregion(&s->bars[2], 0, &s->bar_io[2]);
+
+    memory_region_init(&s->bars[3], OBJECT(s), "idt-bar3",
+                       IDT_BAR_APERTURE_SIZE);
+    memory_region_init_io(&s->bar_io[3], OBJECT(s), &idt_bar3_ops, s,
+                          "idt-bar3-io", IDT_BAR_APERTURE_SIZE);
+    memory_region_add_subregion(&s->bars[3], 0, &s->bar_io[3]);
+
+    memory_region_init(&s->bars[4], OBJECT(s), "idt-bar4",
+                       IDT_BAR_APERTURE_SIZE);
+    memory_region_init_io(&s->bar_io[4], OBJECT(s), &idt_bar4_ops, s,
+                          "idt-bar4-io", IDT_BAR_APERTURE_SIZE);
+    memory_region_add_subregion(&s->bars[4], 0, &s->bar_io[4]);
     //memory_region_init_io(&s->bars[5], OBJECT(s), &idt_bar5_ops, s,
     //                      "idt-bar5", IDT_BAR_APERTURE_SIZE);
 

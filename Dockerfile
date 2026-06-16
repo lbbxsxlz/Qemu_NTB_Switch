@@ -67,6 +67,8 @@ WORKDIR $PROJECT_PATH
 # Copy configs and scripts
 ADD ./scripts $PROJECT_PATH/scripts 
 ADD ./yocto_files $PROJECT_PATH/yocto_files
+ADD ./user_src $PROJECT_PATH/user_src
+ADD ./kernel_src $PROJECT_PATH/kernel_src
 
 ENTRYPOINT ["/home/user/project/scripts/dispatch_docker_command.sh"]
 

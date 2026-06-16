@@ -88,11 +88,21 @@ Run `./run_container.sh -h` to see the help.
 - `--host-build-dir=DIR` sets the relative path to the build directory mapped
   to the container. This argument is not passed to the container's entrypoint.
   By default the `./build_vm_image` directory is used.
+- By default, the script reuses the local `yocto:latest` Docker image when it
+  matches the current Dockerfile, scripts, user ID, and base image. It rebuilds
+  only when that image is missing or those inputs change.
+- `--docker-rebuild` forces rebuilding the Docker image with cache.
 - `--docker-no-cache` forces rebuilding the Docker image without cache.
 - `--docker-shm-size=SIZE` overrides the Docker shared memory size.
 - `--docker-base-image=IMAGE` overrides the Dockerfile base image. This is
   useful when Docker Hub is unreachable and a registry mirror or preloaded
   image must be used instead of `ubuntu:22.04`.
+
+During rebuilds, Docker uses the local base image when available instead of
+checking for a newer remote copy. If a rebuild replaces an existing
+`yocto:latest` image, the script attempts to remove the old untagged image
+automatically. If Docker reports that the old image is still in use, remove it
+later with `docker image prune`.
 
 If the host requires an outbound proxy, export `http_proxy`, `https_proxy`, and
 `no_proxy` before invoking `run_container.sh`. These variables are forwarded to

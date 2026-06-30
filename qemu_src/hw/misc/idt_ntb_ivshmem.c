@@ -1041,7 +1041,7 @@ static uint64_t idt_bar_read(void *opaque, hwaddr addr,
 {
     IVShmemState *s = opaque;
     BARConfig c = s->bar_config[idx];
-    uint64_t ret = 0;
+    uint64_t ret;
 
     if (!c.limit) {
         error_report("idt-ntb-ivshmem: memory window is inactive, reading 0");
@@ -1069,7 +1069,6 @@ static uint64_t idt_bar_read(void *opaque, hwaddr addr,
         case 8:
             ret = qatomic_load_acquire(
                     (uint64_t *)(s->peer_mem + ((uint64_t)c.utbase << 32) + c.ltbase + addr));
-            break;
     }
 
     IVSHMEM_DPRINTF("BAR%d region read: value 0x%lx at offset 0x%lx (bar: 0x%lx, access size: %u)\n",
@@ -1118,7 +1117,6 @@ static void idt_bar_write(void *opaque, hwaddr addr,
             qatomic_store_release(
                     (uint64_t *)(s->peer_mem + ((uint64_t)c.utbase << 32) + c.ltbase + addr),
                     value);
-            break;
     }
 }
 
@@ -1138,6 +1136,7 @@ static void idt_bar_write(void *opaque, hwaddr addr,
 BAR_FNS(2)
 BAR_FNS(3)
 BAR_FNS(4)
+BAR_FNS(5)
 
 #undef BAR_FNS
 #undef BAR_WRITE_FN
@@ -1156,6 +1155,7 @@ BAR_FNS(4)
 BAR_OPS(2);
 BAR_OPS(3);
 BAR_OPS(4);
+BAR_OPS(5);
 
 #undef BAR_OPS
 
@@ -1893,7 +1893,8 @@ static void ivshmem_common_realize(PCIDevice *dev, Error **errp)
     if (!ivshmem_is_master(s)) {
         error_setg(&s->migration_blocker,
                    "Migration is disabled when using feature 'peer mode' in device 'ivshmem'");
-        if (migrate_add_blocker(&s->migration_blocker, errp) < 0) {
+        if (migrate_add_blocker(s->migration_blocker, errp) < 0) {
+            error_free(s->migration_blocker);
             return;
         }
     }
@@ -1967,7 +1968,8 @@ static void ivshmem_exit(PCIDevice *dev)
     int i;
 
     if (s->migration_blocker) {
-        migrate_del_blocker(&s->migration_blocker);
+        migrate_del_blocker(s->migration_blocker);
+        error_free(s->migration_blocker);
     }
 
     if (memory_region_is_mapped(s->ivshmem_bar2)) {
